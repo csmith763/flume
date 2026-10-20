@@ -243,7 +243,7 @@ class OpenMDAOGroupAnalysis(Analysis):
         self.prob.model.add_subsystem(name=obj_name, subsys=self.om_group)
 
         # Perform the setup for the problem so that the component's inputs and outputs are accessibl
-        self.prob.setup()
+        self.prob.setup(force_alloc_complex=True)
         self.prob.final_setup()
 
         # Perform the base class object initialization

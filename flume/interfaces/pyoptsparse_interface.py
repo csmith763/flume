@@ -4,6 +4,22 @@ import numpy as np
 from icecream import ic
 from pyoptsparse import Optimization, Optimizer, Solution
 
+try:
+    import openmdao.api as om
+
+    failures = (
+        om.AnalysisError,
+        ValueError,
+        FloatingPointError,
+        np.linalg.LinAlgError,
+    )
+except:
+    failures = (
+        ValueError,
+        FloatingPointError,
+        np.linalg.LinAlgError,
+    )
+
 
 class FlumePyOptSparseInterface:
 
@@ -123,7 +139,14 @@ class FlumePyOptSparseInterface:
         self._set_system_variables(xdict)
 
         # Execute the required analyses for the System (performs analyses for objective and constraint Analysis objects, and then scaling/assignment happens below)
-        self.flume_sys.execute()
+        try:
+            self.flume_sys.execute()
+        except failures as e:
+            print(f"Rejected trial point: {e}")
+            ic(xdict)
+            if self._last_good_funcs is None:
+                raise  # failure at the initial point: no fallback values exist
+            return {k: np.copy(v) for k, v in self._last_good_funcs.items()}, True
 
         # Extract the objective function output
         self.obj_name = self.flume_sys.obj_local_name
@@ -153,6 +176,7 @@ class FlumePyOptSparseInterface:
         # Update the iteration counter
         self.it_counter += 1
 
+        self._last_good_funcs = {k: np.copy(v) for k, v in funcs.items()}
         return funcs, fail
 
     def _objconGradFun(self, xdict: dict, funcs: dict):
@@ -458,6 +482,7 @@ class FlumePyOptSparseInterface:
         optimizer: str = "SLSQP",
         options: dict = None,
         history_filename: str = None,
+        maxit: int = None,
     ) -> Solution:
         """
         Performs optimization on the Flume System, interfaced with pyOptSparse, using the optimizer specified by the user. If using a proprietary optimizer (i.e. SNOPT or NLPQLP), it is assumed that the user already has access to the optimizer. Additionally, it is assumed IPOPT is already installed if the user wants to use this optimizer.
@@ -491,7 +516,7 @@ class FlumePyOptSparseInterface:
 
         # Update the options with the output directory for the Flume system
         if options is None:
-            self._update_options_output_directory(optimizer, opt)
+            self._update_options_output_directory(optimizer, opt, maxit)
 
         # Set the filepath for the History file, if provided by the user
         if history_filename is not None:
@@ -505,7 +530,9 @@ class FlumePyOptSparseInterface:
         # Return the solution
         return sol
 
-    def _update_options_output_directory(self, optimizer: str, opt: Optimizer):
+    def _update_options_output_directory(
+        self, optimizer: str, opt: Optimizer, maxit: int = None
+    ):
         """
         Private method used to get the default options for a given optimizer name. Uses the default options specified in the pyOptSparse documentation, but overwrites the output file locations so that they are stored in the directory associated with the Flume System.
 
@@ -537,7 +564,12 @@ class FlumePyOptSparseInterface:
             options["Summary file"] = os.path.join(
                 self.flume_sys.log_prefix, "SNOPT_summary.out"
             )
-            options["Verify level"] = 3
+            options["Verify level"] = 0
+            options["Difference interval"] = 1e-8
+
+            if maxit is not None:
+                options["Major iterations limit"] = maxit
+
         elif optimizer.lower() == "ipopt":
             options = opt.getOptions()
             options["output_file"] = os.path.join(
