@@ -18,9 +18,10 @@ class System:
         top_level_analysis_list: List[Analysis],
         log_name: str = "flume.log",
         log_prefix: str = ".",
-        parallel_execution: bool = False,
+        execution_backend: str = "serial",
         parallel_max_workers: int = 4,
         track_node_timing: bool = False,
+        mpi_comm=None,
     ):
         """
         Defines a class that wraps multiple analysis objects into a single system, which can then be utilized to perform optimization with one of Flume's optimizer interfaces after declaring design varaibles, an objective function, and (optionally) constraints.
@@ -39,6 +40,10 @@ class System:
             Boolean operator that specifies whether the DAG should be executed in parallel for the forward and adjoint analyses. Defaults to False.
         parallel_max_workers : int
             Only applied when `parallel_execution` is True. Spawns this many threads for performing the forward/adjoint analyses in parallel.
+        execution_backend : str, optional
+            Execution backend to use: ``"serial"``, ``"thread"``, or ``"mpi"``. If omitted, ``parallel_execution`` selects the serial or thread backend for backwards compatibility. MPI execution is scheduled by rank zero; non-root ranks must call ``serve_mpi_workers()``.
+        mpi_comm : MPI communicator, optional
+            Communicator to use with the MPI backend. Defaults to ``mpi4py.MPI.COMM_WORLD``.
         track_node_timing : bool
             Boolean value that specifies whether the `profile.log` file should track the execution time for the forward and adjoint analyses for each node in the DAG.
         """
@@ -53,22 +58,52 @@ class System:
         self.log_name = log_name
         self.log_prefix = log_prefix
 
-        if not os.path.isdir(self.log_prefix):
-            os.mkdir(self.log_prefix)
+        os.makedirs(self.log_prefix, exist_ok=True)
 
-        # Store the attribute for whether parallel execution should be used
-        self.parallel_execution = parallel_execution
+        # Checks for the execution_backend input
+        if execution_backend not in ("serial", "thread", "mpi"):
+            raise ValueError(
+                "execution_backend must be one of 'serial', 'thread', or 'mpi'."
+            )
+        elif execution_backend == "thread" and parallel_max_workers <= 1:
+            raise RuntimeError(
+                "User specified mode as 'thread', but input for 'parallel_max_workers' <= 1. This should be strictly greater than one to leverage thread-based parallelism."
+            )
+
+        # `parallel_execution` remains available as a compatibility attribute; MPI is selected and dispatched independently.
+        self.execution_backend = execution_backend
+        self.parallel_execution = execution_backend == "thread"
         self.parallel_max_workers = parallel_max_workers
 
-        # Store the attribute for whether per-node timing should be tracked. When
-        # True, each node's individual analysis time is measured/stored (enabling
-        # the summed-CPU and efficiency profile columns and the optional per-node
-        # detail). When False, only the System-level wall-clock time is recorded.
+        # Store the MPI information (only used if execution backend is MPI)
+        self.mpi_comm = None
+        self.mpi_root = 0
+        self._mpi_rank = 0
+        self._mpi_size = 1
+
+        # Update the comm, rank, and size info if MPI is the backend
+        if self.execution_backend == "mpi":
+            try:
+                from mpi4py import MPI
+            except ImportError as exc:
+                raise ImportError(
+                    "execution_backend='mpi' requires mpi4py and an MPI runtime."
+                ) from exc
+
+            self.mpi_comm = MPI.COMM_WORLD if mpi_comm is None else mpi_comm
+            self._mpi_rank = self.mpi_comm.Get_rank()
+            self._mpi_size = self.mpi_comm.Get_size()
+
+        # Store the attribute for whether per-node timing should be tracked. When True, each node's individual analysis time is measured/stored (enabling the summed-CPU and efficiency profile columns and the optional per-node detail). When False, only the System-level wall-clock time is recorded.
         self.track_node_timing = track_node_timing
 
         # Configure the file path for the log file
-        self.outputs_log = Logger(log_path=self.log_prefix, log_name=self.log_name)
-        self.profile_log = Logger(log_path=self.log_prefix, log_name="profile.log")
+        logger_path = self.log_prefix
+        if self.execution_backend == "mpi" and self._mpi_rank != self.mpi_root:
+            logger_path = os.path.join(self.log_prefix, f"mpi_rank_{self._mpi_rank}")
+            os.makedirs(logger_path, exist_ok=True)
+        self.outputs_log = Logger(log_path=logger_path, log_name=self.log_name)
+        self.profile_log = Logger(log_path=logger_path, log_name="profile.log")
 
         # Assemble the list of all analysis objects
         self.full_analysis_list = self.assemble_full_analysis_list()
@@ -196,7 +231,9 @@ class System:
 
     def execute(self, mode: str = "real", debug_print: bool = False):
         """
-        Executes all top-level Analysis objects for the System. Operates in serial or in parallel, depending on the input parameter.
+        Executes all top-level Analysis objects for the System using the
+        configured serial, thread, or MPI backend. MPI execution is root-only;
+        non-root ranks must be running ``serve_mpi_workers()``.
         """
         import time
 
@@ -209,9 +246,13 @@ class System:
         # Whether to track per-node (and summed-CPU) timing
         track = self.track_node_timing
 
-        # Summed per-node CPU time for the forward pass. Only meaningful when
-        # per-node timing is tracked; otherwise left as NaN.
+        # Summed per-node CPU time for the forward pass. Only meaningful when per-node timing is tracked; otherwise left as NaN.
         self.dag_total_time = 0.0 if track else float("nan")
+
+        if self.execution_backend == "mpi":
+            self._execute_mpi(mode=mode, debug_print=debug_print)
+            self.dag_forward_wall = time.perf_counter() - wall_start
+            return
 
         # Serial path for the System, which sequentially executes the objective and all constraint Analysis objects
         if not parallel_execution:
@@ -338,6 +379,781 @@ class System:
 
         return
 
+    def _execute_mpi(self, mode: str, debug_print: bool = False):
+        """
+        Execution function when backend is set to MPI. Executes the forward DAG on rank zero with rank-local MPI workers.
+        """
+
+        # Ensure that the current rank is the MPI root
+        self._mpi_require_root()
+
+        # Get the MPI topology for the DAG
+        nodes, node_ids, signature = self._mpi_topology()
+
+        # Initialize the MPI workers to execute the DAG in forward mode
+        self._mpi_begin_workers("forward", signature, mode=mode)
+
+        # Loop through nodes and initialize the analyses
+        for node in nodes:
+            node._initialize_analysis(mode=mode)
+
+        # Copy the dag_remaining dictionary
+        remaining = self.dag_remaining.copy()
+
+        # Get the list of nodes that are ready to be executed (i.e. they have no dependents)
+        ready = sorted(node_ids[node] for node in nodes if remaining[node] == 0)
+
+        # Set the size of pending nodes and initialize all other information
+        pending = len(nodes)
+        busy = {}
+        failure = None
+        track = self.track_node_timing
+
+        # Get the rank owners for the MPI process
+        rank_owners = self._mpi_node_owners(len(nodes))
+        local_rank_only = self._mpi_size == 1
+
+        # Define a function to run the node
+        def run_local(node_id):
+            # Get the node for its ID and its connections
+            node = nodes[node_id]
+            node._connect()
+
+            # Copy the State information
+            inputs = {
+                name: self._mpi_copy(state.value)
+                for name, state in node.variables.items()
+            }
+
+            # Perform the forward analysis for the node
+            result = self._mpi_run_forward_node(node, inputs, track=track)
+
+            # Apply the outputs and set the time it took to complete the analysis
+            self._mpi_apply_outputs(node, result["outputs"])
+            if track:
+                node.analysis_time = result["elapsed"]
+            return
+
+        # If the MPI size is one, perform the forward analysis on the only rank
+        if local_rank_only:
+            while ready:
+                # Get the current node ID
+                node_id = ready.pop(0)
+
+                # Run the analysis for the node
+                run_local(node_id)
+
+                # Decrement the pending counter
+                pending -= 1
+                node = nodes[node_id]
+
+                # Loop through the dependents for the current node
+                for dependent in self.dag_dependents[node]:
+                    # Decrement the remaining counter
+                    remaining[dependent] -= 1
+
+                    # If there are no remaining dependents, update the list that dneotes the nodes that are ready to execute
+                    if remaining[dependent] == 0:
+                        ready.append(node_ids[dependent])
+
+                # Sort the nodes by ID
+                ready.sort()
+        # MPI-enabled branch
+        else:
+            while pending:
+                # Loop through the worker ranks in MPI size
+                for worker_rank in range(1, self._mpi_size):
+                    if worker_rank in busy or not ready or failure is not None:
+                        continue
+
+                    # Get the next node ID
+                    node_id = next(
+                        (
+                            candidate
+                            for candidate in ready
+                            if rank_owners[candidate] == worker_rank
+                        ),
+                        None,
+                    )
+
+                    if node_id is None:
+                        continue
+
+                    # Remove the node ID from the 'ready' list
+                    ready.remove(node_id)
+
+                    # Extract the node with its node ID and connections info
+                    node = nodes[node_id]
+                    node._connect()
+
+                    # Get the inputs and outputs, using MPI copying
+                    inputs = {
+                        name: self._mpi_copy(state.value)
+                        for name, state in node.variables.items()
+                    }
+                    dependency_outputs = {
+                        node_ids[sub]: self._mpi_export_outputs(sub)
+                        for sub in node.sub_analyses
+                    }
+
+                    # Trigger the execution for the forward task
+                    self.mpi_comm.send(
+                        {
+                            "kind": "forward_task",
+                            "node_id": node_id,
+                            "inputs": inputs,
+                            "dependency_outputs": dependency_outputs,
+                            "mode": mode,
+                            "track": track,
+                        },
+                        dest=worker_rank,
+                        tag=self._MPI_COMMAND_TAG,
+                    )
+
+                    # Mark that the current node is now busy
+                    busy[worker_rank] = node_id
+
+                # Check if the busy dictionary is empty
+                if not busy:
+                    if failure is not None:
+                        break
+                    if ready:
+                        raise RuntimeError(
+                            "MPI DAG scheduler deadlocked: ready nodes have no available owner rank."
+                        )
+                    break
+
+                # Get the results for the current node and MPI rank
+                result, worker_rank = self._mpi_receive_result()
+
+                # Get the expected node ID by popping it out of the busy dictionary
+                expected_node_id = busy.pop(worker_rank)
+
+                # Raise a RuntimeError if the expected node ID does not match the results node ID
+                if result.get("node_id") != expected_node_id:
+                    failure = RuntimeError(
+                        f"MPI worker {worker_rank} returned node "
+                        f"{result.get('node_id')} while executing "
+                        f"{expected_node_id}."
+                    )
+
+                # If the result is okay, proceed by updating the information
+                elif result.get("ok"):
+                    # Get the node for its ID
+                    node = nodes[expected_node_id]
+
+                    # Apply the outputs and update the analysis time
+                    self._mpi_apply_outputs(node, result["outputs"])
+                    if track:
+                        node.analysis_time = result["elapsed"]
+
+                    # Decrement the pending counter
+                    pending -= 1
+
+                    # Loop through the dependents for the node
+                    for dependent in self.dag_dependents[node]:
+                        # Decrement the counter for the dependents
+                        remaining[dependent] -= 1
+
+                        # If the dependent has no more remaining dependencies, update that it is ready
+                        if remaining[dependent] == 0:
+                            ready.append(node_ids[dependent])
+
+                    # Sort the ready list by node ID
+                    ready.sort()
+
+                # Triger failure information
+                elif failure is None:
+                    message = (
+                        f"MPI forward analysis failed on rank {worker_rank} "
+                        f"for node {nodes[expected_node_id].obj_name}: "
+                        f"{result.get('exception_message', 'Unknown worker error')}\n"
+                        f"{result.get('error', 'No worker traceback available.')}"
+                    )
+                    failure = self._mpi_rebuild_exception(result, message)
+
+            # Raise the failure if it is not None
+            if failure is not None:
+                raise failure
+
+        # Update the total DAG time for forward execution if tracking is turned on
+        if track:
+            self.dag_total_time = sum(
+                getattr(node, "analysis_time", 0.0) for node in nodes
+            )
+
+        if debug_print:
+            print(
+                f"MPI DAG forward pass completed on {self._mpi_size} rank(s); "
+                f"nodes={len(nodes)}"
+            )
+
+    # Define tags for MPI communication information
+    _MPI_COMMAND_TAG = 27101  # command tag: rank 0 -> worker process
+    _MPI_RESULT_TAG = 27102  # result tag: worker process -> rank 0
+
+    @staticmethod
+    def _mpi_rebuild_exception(result, message):
+        """
+        Rebuild a worker's forward-analysis exception on rank zero with its original type, so callers see the same exception class as with the serial backend (e.g. an optimizer interface that rejects a trial point on ValueError or LinAlgError). Falls back to RuntimeError when the class cannot be imported or constructed from a message.
+        """
+
+        # If a recoverable analysis error is detected in the result, return that error to rank0
+        if result.get("recoverable_analysis_error"):
+            from openmdao.core.analysis_error import AnalysisError
+
+            return AnalysisError(message)
+
+        # Catch the exception class coming from the result
+        class_info = result.get("exception_class")
+        if class_info is not None:
+            try:
+                import importlib
+
+                # Extract the module and qualifying name for the class
+                module_name, qualname = class_info
+                exc_class = importlib.import_module(module_name)
+
+                # Get the exception class
+                for attr in qualname.split("."):
+                    exc_class = getattr(exc_class, attr)
+
+                # Return the exception class with the message if it is actually an aception class
+                if isinstance(exc_class, type) and issubclass(exc_class, Exception):
+                    return exc_class(message)
+
+            except Exception:
+                pass
+
+        return RuntimeError(message)
+
+    @staticmethod
+    def _mpi_copy(value):
+        """
+        Copy array/scalar State data before handing it to mpi4py.
+        """
+        import copy
+
+        return copy.deepcopy(value)
+
+    def _mpi_require_root(self):
+        """
+        Private helper that makes sure the current MPI rank is the root, otherwise raises a RuntimeError.
+        """
+
+        if self._mpi_rank != self.mpi_root:
+            raise RuntimeError(
+                f"MPI System.execute()/execute_adjoint() may only be called on rank {self.mpi_root}; rank {self._mpi_rank} must call serve_mpi_workers()."
+            )
+
+        return
+
+    def _mpi_topology(self):
+        """
+        Return deterministic node ordering, IDs, and a cross-rank signature.
+        """
+
+        # Build the DAG for the System
+        self.build_dag()
+
+        # Initialize a list for the ordered DAG nodes and a set for the nodes that have been seen already
+        ordered = []
+        seen = set()
+
+        # Define the visit function, which adds nodes into the 'ordered' list and the 'seen' set
+        def visit(node):
+            # If node has already been seen, return
+            if node in seen:
+                return
+
+            # Otherwise, add to the set
+            seen.add(node)
+
+            # Trace through the sub-analyses for the current node, executing the 'visit' function on each
+            for sub_analysis in node.sub_analyses:
+                visit(sub_analysis)
+
+            # Add the node to the 'ordered' list
+            ordered.append(node)
+
+        # Visit all top-level analyses in the list
+        for top_level in self.top_level_analysis_list:
+            visit(top_level)
+
+        # Set the node IDs in a dictionary by enumerating through the ordered list
+        node_ids = {node: index for index, node in enumerate(ordered)}
+
+        # Define a signature for each node in the 'ordered' list, which stores a variety of information for each node in the DAG
+        signature = tuple(
+            (
+                index,  # index number
+                node.obj_name,  # object name for the node
+                node.__class__.__module__,  # module for the node's class
+                node.__class__.__qualname__,  # qualiified name for the node's class
+                tuple(
+                    node_ids[sub] for sub in node.sub_analyses
+                ),  # tuple of node IDs for the node's sub-analyses
+                tuple(node.variables),  # tuple of node variable names
+            )
+            for index, node in enumerate(ordered)
+        )
+
+        # Store the information in MPI-specific attributes
+        self._mpi_nodes = ordered
+        self._mpi_node_ids = node_ids
+        self._mpi_topology_signature = signature
+
+        return ordered, node_ids, signature
+
+    def _mpi_node_owners(self, n_nodes):
+        """
+        Private helper to the rank owners for MPI.
+        """
+
+        # If the MPI size is one, return the root
+        if self._mpi_size == 1:
+            return {node_id: self.mpi_root for node_id in range(n_nodes)}
+        # Otherwise, increment the node IDs based on the MPI size
+        return {
+            node_id: 1 + (node_id % (self._mpi_size - 1)) for node_id in range(n_nodes)
+        }
+
+    def _mpi_begin_workers(self, phase, signature, **kwargs):
+        """
+        Private method which starts the MPI workers for forward execution of the DAG.
+        """
+
+        # If the MPI size is 1, return
+        if self._mpi_size == 1:
+            return
+
+        # Sweep through the MPI size and send info to each of the MPI workers
+        for worker_rank in range(1, self._mpi_size):
+            # Send information from the root to a worker proces
+            self.mpi_comm.send(
+                {
+                    "kind": "begin",
+                    "phase": phase,
+                    "signature": signature,
+                    **kwargs,
+                },
+                dest=worker_rank,
+                tag=self._MPI_COMMAND_TAG,
+            )
+
+        # Loop through the workers, receive results, and store errors (if any)
+        errors = []
+        for _ in range(self._mpi_size - 1):
+            # Receive the result for the current worker process
+            result, worker_rank = self._mpi_receive_result()
+
+            # If the result did not terminate successfully, append the error information
+            if not result.get("ok"):
+                errors.append(
+                    f"rank {worker_rank}: "
+                    f"{result.get('error', 'worker initialization failed')}"
+                )
+
+        # If any errors were detected, raise a RuntimeError
+        if errors:
+            raise RuntimeError(
+                f"MPI worker initialization failed for {phase}: " + "; ".join(errors)
+            )
+
+        return
+
+    def _mpi_receive_result(self):
+        """
+        Method which receives the results using MPI.
+        """
+        from mpi4py import MPI
+
+        # Get the MPI status
+        status = MPI.Status()
+
+        # Receive the result using MPI comm info, and return the info
+        result = self.mpi_comm.recv(
+            source=MPI.ANY_SOURCE,
+            tag=self._MPI_RESULT_TAG,
+            status=status,
+        )
+        return result, status.Get_source()
+
+    def _mpi_apply_outputs(self, node, output_values):
+        """
+        Method which loops thorugh and copies the values from output States
+        """
+
+        from flume.base_classes.state import State
+
+        if not hasattr(node, "outputs"):
+            node.outputs = {}
+
+        # Loop through outputs in the output_values dictionary
+        for name, output in output_values.items():
+            # Copy the value using MPI
+            value = self._mpi_copy(output["value"])
+
+            # If the name is in the current node's outputs, set the value
+            if name in node.outputs:
+                node.outputs[name].value = value
+
+            # Otherwise, create a new output for the node
+            else:
+                node.outputs[name] = State(
+                    value=value,
+                    desc=output["desc"],
+                    source=node,
+                )
+
+        return
+
+    def _mpi_export_outputs(self, node):
+        """
+        Exports output information for a node using MPI copy. Returns a dictionary that shares the same name: value & desc information for the outputs of the input node.
+        """
+
+        return {
+            name: {
+                "value": self._mpi_copy(state.value),
+                "desc": state.desc,
+            }
+            for name, state in node.outputs.items()
+        }
+
+    def _mpi_run_forward_node(self, node, inputs, track, dependency_outputs=None):
+        """
+        Private method that executes the forward analysis for a node in the graph.
+        """
+        import time
+
+        # Loop through the dependent output values for the current node
+        for dependency_id, output_values in (dependency_outputs or {}).items():
+            # Apply the output values for the curent node
+            self._mpi_apply_outputs(self._mpi_nodes[dependency_id], output_values)
+
+        # Get the connections for the node
+        node._connect()
+
+        # Loop through the inputs and assign the values into the State objects for the current node using MPI copy
+        for name, value in inputs.items():
+            node.variables[name].value = self._mpi_copy(value)
+
+        # Time and perform the analysis
+        start = time.perf_counter()
+        node._analyze()
+        elapsed = time.perf_counter() - start
+
+        # Update the analyzed attribute
+        node.analyzed = True
+
+        # Set the dictionary that will be returned
+        forward_node_outputs = {
+            "outputs": {
+                name: {
+                    "value": self._mpi_copy(state.value),
+                    "desc": state.desc,
+                }
+                for name, state in node.outputs.items()
+            },
+            "elapsed": elapsed if track else 0.0,
+        }
+
+        return forward_node_outputs
+
+    def serve_mpi_workers(self):
+        """
+        Serve root-scheduled MPI DAG tasks on a non-root rank.
+
+        Construct the same ``System`` on every rank. Rank zero runs the optimizer; every other rank calls this method and remains in the worker loop until root calls :meth:`shutdown_mpi_workers`.
+        """
+
+        # Raise an error if MPI is not the backend for the system
+        if self.execution_backend != "mpi":
+            raise RuntimeError("serve_mpi_workers() requires execution_backend='mpi'.")
+
+        # Raise an error if the current MPI rank is not the root
+        if self._mpi_rank == self.mpi_root:
+            raise RuntimeError(
+                "Rank zero runs the optimizer and must not call " "serve_mpi_workers()."
+            )
+
+        # Initialize the nodes and signature info
+        nodes = None
+        signature = None
+        while True:
+            # Get the command and its type
+            command = self.mpi_comm.recv(
+                source=self.mpi_root, tag=self._MPI_COMMAND_TAG
+            )
+
+            kind = command.get("kind")
+
+            # If command kind is stop
+            if kind == "stop":
+                # Send info
+                self.mpi_comm.send(
+                    {"ok": True, "kind": "stopped"},
+                    dest=self.mpi_root,
+                    tag=self._MPI_RESULT_TAG,
+                )
+                return
+
+            # If kind is begin, start the execution
+            if kind == "begin":
+                try:
+                    # Get the MPI topology and command from the signature
+                    nodes, _, signature = self._mpi_topology()
+                    if signature != command["signature"]:
+                        raise RuntimeError(
+                            "DAG topology differs from rank zero; all ranks must construct the same analyses in the same order."
+                        )
+
+                    # Initialize forward analyses
+                    if command["phase"] == "forward":
+                        for node in nodes:
+                            node._initialize_analysis(mode=command["mode"])
+
+                    # Pass in adjoint mode
+                    elif command["phase"] == "adjoint":
+                        pass
+
+                    # Raise an error that an known MPI phase was detected
+                    else:
+                        raise ValueError(f"Unknown MPI phase {command['phase']!r}.")
+
+                    # Set the response
+                    response = {"ok": True, "kind": "ready"}
+
+                # Set the response if there was an exception, reporting the error back to the top rank
+                except Exception:
+                    import traceback
+
+                    response = {
+                        "ok": False,
+                        "kind": "ready",
+                        "error": traceback.format_exc(),
+                    }
+
+                # Send the info from the current result tag to the root
+                self.mpi_comm.send(
+                    response,
+                    dest=self.mpi_root,
+                    tag=self._MPI_RESULT_TAG,
+                )
+                continue
+
+            # If kind is forward_task, execute the forward analysis
+            if kind == "forward_task":
+                # Get the node ID
+                node_id = command["node_id"]
+
+                # Try executing the forward node analysis with MPI
+                try:
+                    result = self._mpi_run_forward_node(
+                        nodes[node_id],
+                        command["inputs"],
+                        track=command["track"],
+                        dependency_outputs=command["dependency_outputs"],
+                    )
+                    response = {"ok": True, "node_id": node_id, **result}
+                # If an exception is raised, record the exception info in the response
+                except Exception as exc:
+                    import traceback
+
+                    exception_mro = type(exc).__mro__
+                    response = {
+                        "ok": False,
+                        "node_id": node_id,
+                        "exception_message": str(exc),
+                        "exception_class": (
+                            type(exc).__module__,
+                            type(exc).__qualname__,
+                        ),
+                        "recoverable_analysis_error": any(
+                            cls.__module__ == "openmdao.core.analysis_error"
+                            and cls.__name__ == "AnalysisError"
+                            for cls in exception_mro
+                        ),
+                        "error": traceback.format_exc(),
+                    }
+
+                # Send the response from the forward execution to the root
+                self.mpi_comm.send(
+                    response,
+                    dest=self.mpi_root,
+                    tag=self._MPI_RESULT_TAG,
+                )
+                continue
+
+            # If kind is adjoint task, execute the adjoint analysis
+            if kind == "adjoint_task":
+
+                # Try executing the adjoint analysis with MPI
+                try:
+                    response = self._mpi_run_adjoint_node(
+                        nodes[command["node_id"]],
+                        command["node_id"],
+                        command["sweep_id"],
+                        command["output_seeds"],
+                        command["variable_keys"],
+                        command["track"],
+                    )
+                    # Update the response
+                    response.update(
+                        {
+                            "ok": True,
+                            "node_id": command["node_id"],
+                            "sweep_id": command["sweep_id"],
+                        }
+                    )
+                # If an exception is raised, record the exception info in the response
+                except Exception:
+                    import traceback
+
+                    response = {
+                        "ok": False,
+                        "node_id": command["node_id"],
+                        "sweep_id": command["sweep_id"],
+                        "error": traceback.format_exc(),
+                    }
+
+                # Send the response from the adjoint execution back to the root
+                self.mpi_comm.send(
+                    response,
+                    dest=self.mpi_root,
+                    tag=self._MPI_RESULT_TAG,
+                )
+                continue
+
+            # If kind is call, run a provided function with the current node's live state (for callback functions)
+            if kind == "call":
+                try:
+                    if nodes is None:
+                        nodes, _, _ = self._mpi_topology()
+                    value = command["func"](
+                        nodes[command["node_id"]],
+                        *command["args"],
+                        **command["kwargs"],
+                    )
+                    response = {"ok": True, "kind": "call_result", "value": value}
+                except Exception:
+                    import traceback
+
+                    response = {
+                        "ok": False,
+                        "kind": "call_result",
+                        "error": traceback.format_exc(),
+                    }
+
+                # Send the result from the call back to the root
+                self.mpi_comm.send(
+                    response,
+                    dest=self.mpi_root,
+                    tag=self._MPI_RESULT_TAG,
+                )
+                continue
+
+            # Raise runtime error if this is reached, unknown command is trying to be passed
+            raise RuntimeError(f"Unknown MPI worker command {kind!r}.")
+
+        return
+
+    def shutdown_mpi_workers(self):
+        """
+        Stop all non-root MPI workers after the optimizer has completed."""
+        # Raise an error if the execution backend is not MPI
+        if self.execution_backend != "mpi":
+            raise RuntimeError(
+                "shutdown_mpi_workers() requires execution_backend='mpi'."
+            )
+
+        # Ensure that the current rank is the MPI root
+        self._mpi_require_root()
+
+        # Send the information depending on the MPI size
+        if self._mpi_size == 1:
+            return
+        for worker_rank in range(1, self._mpi_size):
+            self.mpi_comm.send(
+                {"kind": "stop"},
+                dest=worker_rank,
+                tag=self._MPI_COMMAND_TAG,
+            )
+
+        # Detect and store any errors
+        errors = []
+        for _ in range(self._mpi_size - 1):
+            result, worker_rank = self._mpi_receive_result()
+            if result.get("kind") != "stopped" or not result.get("ok"):
+                errors.append(f"rank {worker_rank}: {result!r}")
+
+        # Raise a RuntimeError if the MPI workers did not shut down correctly
+        if errors:
+            raise RuntimeError(
+                "MPI workers did not shut down cleanly: " + "; ".join(errors)
+            )
+
+        return
+
+    def call_on_owner(self, node, func, *args, **kwargs):
+        """
+        Evaluate ``func(node, *args, **kwargs)`` against the live state of ``node``.
+
+        With the MPI backend only the rank that owns a node executes its ``_analyze``, so any internal state that is not a Flume output (e.g. an OpenMDAO problem's intermediate variables or a cached trajectory) is current only on that rank. This method runs ``func`` on the owner rank and returns its result to rank zero. For the serial and thread backends it simply calls ``func`` locally.
+
+        The result reflects the owner's most recent forward evaluation, so call this after ``execute()`` at the design point of interest.
+
+        Parameters
+        ----------
+        node : Analysis
+            Analysis object in this System's DAG whose state should be read
+        func : callable
+            Module-level function (it is pickled by reference for MPI) taking the
+            node as its first argument and returning picklable data
+        *args, **kwargs
+            Additional picklable arguments forwarded to ``func``
+
+        Returns
+        -------
+        The value returned by ``func`` on the owner rank.
+        """
+        if self.execution_backend != "mpi" or self._mpi_size == 1:
+            return func(node, *args, **kwargs)
+
+        self._mpi_require_root()
+        if (
+            getattr(self, "_mpi_node_ids", None) is None
+            or node not in self._mpi_node_ids
+        ):
+            self._mpi_topology()
+        node_id = self._mpi_node_ids[node]
+        owner = self._mpi_node_owners(len(self._mpi_nodes))[node_id]
+
+        self.mpi_comm.send(
+            {
+                "kind": "call",
+                "node_id": node_id,
+                "func": func,
+                "args": args,
+                "kwargs": kwargs,
+            },
+            dest=owner,
+            tag=self._MPI_COMMAND_TAG,
+        )
+        result, worker_rank = self._mpi_receive_result()
+        if result.get("kind") != "call_result" or worker_rank != owner:
+            raise RuntimeError(
+                f"Unexpected MPI reply from rank {worker_rank} to call_on_owner "
+                f"for node '{node.obj_name}': {result!r}"
+            )
+        if not result.get("ok"):
+            raise RuntimeError(
+                f"call_on_owner failed on rank {owner} for node "
+                f"'{node.obj_name}':\n{result.get('error')}"
+            )
+        return result["value"]
+
     def _collect_sinks_info(self):
         """
         Helper method which is used to collect the information for all sinks in the DAG (i.e. top-level Analysis objects) and the reverse mapping.
@@ -432,7 +1248,9 @@ class System:
 
     def execute_adjoint(self, debug_print: bool = False):
         """
-        Executes the adjoint analysis for the System. Operates in serial or in parallel, depending on the boolean attribute for parallel execution. If executing in parallel, makes use of ThreadPoolExecutor to sweep over adjoint analyses for each output of interest (i.e. objective or constraints) in parallel, known as a sweep in code. Within a given sweep, also uses ancestor dictionary to execute adjoint analyses in parallel as soon as all of a nodes dependents have completed their respective adjoint analyses. Thus, leverages two forms of parallelism here. Note that locks are used for the _analyze_adjoint method to prevent instances when two sweeps attempt to call this method at the same time.
+        Execute objective and constraint adjoints using the configured backend.
+        MPI execution is root-only; non-root ranks must be running
+        ``serve_mpi_workers()``.
         """
 
         # Get the information for the sweeps that are required (i.e. the total number of quantities of interest, one objective and each constraint)
@@ -455,6 +1273,11 @@ class System:
         # Extract the parallel execution attribute
         parallel_execution = self.parallel_execution
 
+        if self.execution_backend == "mpi":
+            self._execute_adjoint_mpi(debug_print=debug_print)
+            self.dag_adjoint_wall = time.perf_counter() - wall_start
+            return
+
         # Serial path for the adjoint analysis of the System, which sequentially executes the objective and all constraint Analysis objects (and serially traces through the stack)
         if not parallel_execution:
             # Loop through the sweeps, and execute all of the adjoint paths serially
@@ -476,6 +1299,7 @@ class System:
             self.dag_adjoint_wall = time.perf_counter() - wall_start
 
             return
+
         # Parallel path for the adjoint analysis (parallelizes over the top-level Analysis objects and within each sweep)
         else:
             from concurrent.futures import ThreadPoolExecutor
@@ -643,6 +1467,290 @@ class System:
         self.dag_adjoint_wall = time.perf_counter() - wall_start
 
         return
+
+    def _execute_adjoint_mpi(self, debug_print: bool = False):
+        """Run reverse-DAG sweeps and reduce derivative contributions on root."""
+        self._mpi_require_root()
+        nodes, node_ids, signature = self._mpi_topology()
+        self._mpi_begin_workers("adjoint", signature)
+        for node in nodes:
+            node._connect()
+
+        sinks_info, _ = self._collect_sinks_info()
+        dependents = self.dag_dependents
+        sink_ancestors = {}
+        for _, sink, _, _ in sinks_info:
+            ancestors = set()
+            stack = [sink]
+            while stack:
+                node = stack.pop()
+                if node in ancestors:
+                    continue
+                ancestors.add(node)
+                stack.extend(node.sub_analyses)
+            sink_ancestors[sink] = ancestors
+        sink_seeds = {}
+        remaining = {}
+        ancestors_by_sweep = {}
+
+        for sweep_id, sink, output_name, seed in sinks_info:
+            output_state = sink.outputs[output_name]
+            state_key = self._mpi_state_key(output_state, node_ids)
+            sink_seeds.setdefault((sweep_id, state_key), None)
+            sink_seeds[(sweep_id, state_key)] = self._mpi_add(
+                sink_seeds[(sweep_id, state_key)], seed
+            )
+            ancestors = sink_ancestors[sink]
+            ancestors_by_sweep[sweep_id] = ancestors
+            remaining[sweep_id] = {
+                node: sum(1 for dependent in dependents[node] if dependent in ancestors)
+                for node in ancestors
+            }
+
+        contributions = {}
+        rank_owners = self._mpi_node_owners(len(nodes))
+        track = self.track_node_timing
+        if track:
+            for node in nodes:
+                node.adjoint_time = 0.0
+            self.dag_adjoint_time = 0.0
+
+        ready = []
+        for sweep_id, _, _, _ in sinks_info:
+            for node, count in remaining[sweep_id].items():
+                if count == 0:
+                    ready.append((sweep_id, node_ids[node]))
+        ready.sort(key=lambda item: (self._mpi_sweep_sort_key(item[0]), item[1]))
+
+        pending = sum(len(sweep_nodes) for sweep_nodes in remaining.values())
+        failure = None
+
+        def run_task(sweep_id, node_id):
+            node = nodes[node_id]
+            output_seeds = {}
+            for name, state in node.outputs.items():
+                key = self._mpi_state_key(state, node_ids)
+                seed = sink_seeds.get((sweep_id, key))
+                seed = self._mpi_add(seed, contributions.get((sweep_id, key)))
+                output_seeds[name] = (
+                    self._mpi_copy(seed)
+                    if seed is not None
+                    else self._mpi_zero(state.value)
+                )
+            variable_keys = {
+                name: self._mpi_state_key(state, node_ids)
+                for name, state in node.variables.items()
+            }
+            return self._mpi_run_adjoint_node(
+                node,
+                node_id,
+                sweep_id,
+                output_seeds,
+                variable_keys,
+                track,
+            )
+
+        def complete_node(sweep_id, node_id, result):
+            nonlocal pending, failure
+            node = nodes[node_id]
+            if not result.get("ok", True):
+                if failure is None:
+                    failure = RuntimeError(
+                        f"MPI adjoint failed on a worker for "
+                        f"{node.obj_name}, sweep {sweep_id}:\n"
+                        f"{result.get('error', 'Unknown worker error')}"
+                    )
+                return
+            for state_key, value in result["contributions"].items():
+                key = (sweep_id, state_key)
+                contributions[key] = self._mpi_add(contributions.get(key), value)
+            if track:
+                elapsed = result["elapsed"]
+                node.adjoint_time += elapsed
+                self.dag_adjoint_time += elapsed
+            pending -= 1
+            ancestors = ancestors_by_sweep[sweep_id]
+            for sub_analysis in node.sub_analyses:
+                if sub_analysis not in ancestors:
+                    continue
+                remaining[sweep_id][sub_analysis] -= 1
+                if remaining[sweep_id][sub_analysis] == 0:
+                    ready.append((sweep_id, node_ids[sub_analysis]))
+            ready.sort(key=lambda item: (self._mpi_sweep_sort_key(item[0]), item[1]))
+
+        if self._mpi_size == 1:
+            while ready:
+                sweep_id, node_id = ready.pop(0)
+                result = run_task(sweep_id, node_id)
+                complete_node(sweep_id, node_id, result)
+                if failure is not None:
+                    raise failure
+        else:
+            busy = {}
+            while pending:
+                for worker_rank in range(1, self._mpi_size):
+                    if worker_rank in busy or not ready or failure is not None:
+                        continue
+                    task_position = next(
+                        (
+                            position
+                            for position, (_, node_id) in enumerate(ready)
+                            if rank_owners[node_id] == worker_rank
+                        ),
+                        None,
+                    )
+                    if task_position is None:
+                        continue
+                    sweep_id, node_id = ready.pop(task_position)
+                    node = nodes[node_id]
+                    output_seeds = {}
+                    for name, state in node.outputs.items():
+                        state_key = self._mpi_state_key(state, node_ids)
+                        seed = sink_seeds.get((sweep_id, state_key))
+                        seed = self._mpi_add(
+                            seed, contributions.get((sweep_id, state_key))
+                        )
+                        output_seeds[name] = (
+                            self._mpi_copy(seed)
+                            if seed is not None
+                            else self._mpi_zero(state.value)
+                        )
+                    variable_keys = {
+                        name: self._mpi_state_key(state, node_ids)
+                        for name, state in node.variables.items()
+                    }
+                    self.mpi_comm.send(
+                        {
+                            "kind": "adjoint_task",
+                            "node_id": node_id,
+                            "sweep_id": sweep_id,
+                            "output_seeds": output_seeds,
+                            "variable_keys": variable_keys,
+                            "track": track,
+                        },
+                        dest=worker_rank,
+                        tag=self._MPI_COMMAND_TAG,
+                    )
+                    busy[worker_rank] = (sweep_id, node_id)
+
+                if not busy:
+                    if failure is not None:
+                        break
+                    if ready:
+                        raise RuntimeError(
+                            "MPI adjoint scheduler deadlocked: ready tasks "
+                            "have no available owner rank."
+                        )
+                    break
+
+                result, worker_rank = self._mpi_receive_result()
+                expected_sweep, expected_node_id = busy.pop(worker_rank)
+                if (
+                    result.get("node_id") != expected_node_id
+                    or result.get("sweep_id") != expected_sweep
+                ):
+                    if failure is None:
+                        failure = RuntimeError(
+                            f"MPI worker {worker_rank} returned an unexpected "
+                            "adjoint task result."
+                        )
+                else:
+                    complete_node(expected_sweep, expected_node_id, result)
+
+            if failure is not None:
+                raise failure
+
+        self.design_derivs = {}
+        for sweep_id, _, _, _ in sinks_info:
+            sweep_derivs = {}
+            for global_name, metadata in self.design_vars_info.items():
+                state = metadata["instance"].variables[metadata["local_name"]]
+                state_key = self._mpi_state_key(state, node_ids)
+                value = contributions.get((sweep_id, state_key))
+                if value is None:
+                    value = self._mpi_zero(state.value)
+                state._deriv_store[sweep_id] = self._mpi_copy(value)
+                sweep_derivs[global_name] = self._mpi_copy(value)
+            self.design_derivs[sweep_id] = sweep_derivs
+
+        if debug_print:
+            print(
+                f"MPI DAG adjoint pass completed on {self._mpi_size} rank(s); "
+                f"sweeps={len(sinks_info)}"
+            )
+
+    @staticmethod
+    def _mpi_sweep_sort_key(sweep_id):
+        return repr(sweep_id)
+
+    @staticmethod
+    def _mpi_zero(value):
+        return np.zeros(value.shape) if isinstance(value, np.ndarray) else 0.0
+
+    @staticmethod
+    def _mpi_add(left, right):
+        if left is None:
+            return None if right is None else System._mpi_copy(right)
+        if right is None:
+            return System._mpi_copy(left)
+        return left + right
+
+    def _mpi_state_key(self, state, node_ids):
+        source = state.source
+        if source not in node_ids:
+            raise RuntimeError(
+                f"State {state.desc!r} has a source outside this System's DAG."
+            )
+        for name, source_state in source.outputs.items():
+            if source_state is state:
+                return ("output", node_ids[source], name)
+        for name, source_state in source.variables.items():
+            if source_state is state:
+                return ("variable", node_ids[source], name)
+        raise RuntimeError(
+            f"Could not identify State {state.desc!r} on its source analysis "
+            f"{source.obj_name!r}."
+        )
+
+    def _mpi_run_adjoint_node(
+        self, node, node_id, sweep_id, output_seeds, variable_keys, track
+    ):
+        import time
+        from flume.base_classes.state import _current_sweep, _current_writer
+
+        states = {
+            id(state): state
+            for state in list(node.outputs.values()) + list(node.variables.values())
+        }
+        for state in states.values():
+            state.ensure_sweep_slot(sweep_id)
+            state.prepare_writer_slot(sweep_id, node_id)
+        for name, seed in output_seeds.items():
+            node.outputs[name]._deriv_store[(sweep_id, node_id)] = self._mpi_copy(seed)
+
+        token_sweep = _current_sweep.set(sweep_id)
+        token_writer = _current_writer.set(node_id)
+        start = time.perf_counter()
+        try:
+            node._analyze_adjoint()
+            node.adjoint_analyzed = True
+        finally:
+            elapsed = time.perf_counter() - start
+            _current_writer.reset(token_writer)
+            _current_sweep.reset(token_sweep)
+
+        contributions = {}
+        for name, state_key in variable_keys.items():
+            if state_key in contributions:
+                continue
+            state = node.variables[name]
+            contributions[state_key] = self._mpi_copy(
+                state._deriv_store[(sweep_id, node_id)]
+            )
+        return {
+            "contributions": contributions,
+            "elapsed": elapsed if track else 0.0,
+        }
 
     def graph_network(
         self,
@@ -912,7 +2020,7 @@ class System:
                             top_attrs["style"] = "rounded,filled"
                             top_attrs["fillcolor"] = _top_fill
                             top_attrs["color"] = _border_color(_top_fill)
-                        label = f"<<B>{sub.obj_name}</B><BR/><I>Outputs: {out_str}</I>>"
+                        label = f"<<B>{sub.obj_name}</B><BR/>>"  # <I>Outputs: {out_str}</I>>"
                         graph.node(
                             sub.obj_name,
                             label,
@@ -1380,7 +2488,11 @@ class System:
 
         # Log the header and the execution mode every 10 iterations
         if iter_number % 10 == 0:
-            mode = "parallel" if self.parallel_execution else "serial"
+            mode = (
+                "parallel"
+                if self.execution_backend == "thread"
+                else self.execution_backend
+            )
             self.profile_log.log(
                 "\n# mode: %s, max_workers: %s, track_node_timing: %s"
                 % (

@@ -67,6 +67,9 @@ class FlumePyOptSparseInterface:
         # Initialize the iteration counter
         self.it_counter = 0
 
+        # Initialize the most recent successful function values, which are returned (with fail=True) when a trial point is rejected; None until the first successful evaluation
+        self._last_good_funcs = None
+
     def _set_system_variables(self, xdict: dict):
         """
         Private method that is used to set the design variables values provided in the input dictionary into the various Flume Analysis objects.
@@ -426,8 +429,21 @@ class FlumePyOptSparseInterface:
             Instance of the Optimization class, which specifies the structure of the optimization problem of interest
         """
 
+        # Keep pyOptSparse's optimizer protocol local to rank zero. Its MPI
+        # optimizers use optProb.comm for their own worker loops, which would
+        # conflict with Flume's independent DAG-worker protocol on COMM_WORLD.
+        optimizer_comm = None
+        if self.flume_sys.execution_backend == "mpi" and self.flume_sys._mpi_size > 1:
+            from mpi4py import MPI
+
+            optimizer_comm = MPI.COMM_SELF
+
         # Construct the Optimization problem
-        optProb = Optimization(name=opt_prob_name, objFun=self._objconfun)
+        optProb = Optimization(
+            name=opt_prob_name,
+            objFun=self._objconfun,
+            comm=optimizer_comm,
+        )
 
         # Add the design variable groups to the problem
         self._addVarGroups(x0dict=x0dict, optProb=optProb)
@@ -483,7 +499,7 @@ class FlumePyOptSparseInterface:
         options: dict = None,
         history_filename: str = None,
         maxit: int = None,
-    ) -> Solution:
+    ) -> Solution | None:
         """
         Performs optimization on the Flume System, interfaced with pyOptSparse, using the optimizer specified by the user. If using a proprietary optimizer (i.e. SNOPT or NLPQLP), it is assumed that the user already has access to the optimizer. Additionally, it is assumed IPOPT is already installed if the user wants to use this optimizer.
 
@@ -502,33 +518,57 @@ class FlumePyOptSparseInterface:
 
         Returns
         -------
-        sol : Solution
-            Returns an instance of the pyOptSparse Solution class, which describes the solution for an optimization problem. The final design variables, objective, and Lagrange multipleirs can be accesses with sol.xStar, sol.fStar, and sol.lambdaStar, respectively
+        sol : Solution or None
+            Rank zero returns the pyOptSparse Solution. In MPI mode, non-root
+            ranks serve Flume DAG work and return None after rank zero finishes.
         """
 
-        # Construct the optimization problem
-        opt, optProb = self._construct_optimization_problem(
-            opt_prob_name=opt_prob_name,
-            x0dict=x0dict,
-            optimizer=optimizer,
-            options=options,
+        mpi_worker = (
+            self.flume_sys.execution_backend == "mpi"
+            and self.flume_sys._mpi_size > 1
+            and self.flume_sys._mpi_rank != self.flume_sys.mpi_root
+        )
+        if mpi_worker:
+            self.flume_sys.serve_mpi_workers()
+            return None
+
+        is_mpi_root = (
+            self.flume_sys.execution_backend == "mpi"
+            and self.flume_sys._mpi_size > 1
+            and self.flume_sys._mpi_rank == self.flume_sys.mpi_root
         )
 
-        # Update the options with the output directory for the Flume system
-        if options is None:
-            self._update_options_output_directory(optimizer, opt, maxit)
+        try:
+            # Construct the optimization problem
+            opt, optProb = self._construct_optimization_problem(
+                opt_prob_name=opt_prob_name,
+                x0dict=x0dict,
+                optimizer=optimizer,
+                options=options,
+            )
 
-        # Set the filepath for the History file, if provided by the user
-        if history_filename is not None:
-            storeHistory = os.path.join(self.flume_sys.log_prefix, history_filename)
-        else:
-            storeHistory = None
+            # Update the options with the output directory for the Flume system
+            if options is None:
+                self._update_options_output_directory(optimizer, opt, maxit)
 
-        # Perform the optimization
-        sol = opt(optProb, sens=self._objconGradFun, storeHistory=storeHistory)
+            # Set the filepath for the History file, if provided by the user
+            if history_filename is not None:
+                storeHistory = os.path.join(self.flume_sys.log_prefix, history_filename)
+            else:
+                storeHistory = None
 
-        # Return the solution
-        return sol
+            # Perform the optimization
+            sol = opt(
+                optProb,
+                sens=self._objconGradFun,
+                storeHistory=storeHistory,
+                sensMode="pgc",
+            )
+
+            return sol
+        finally:
+            if is_mpi_root:
+                self.flume_sys.shutdown_mpi_workers()
 
     def _update_options_output_directory(
         self, optimizer: str, opt: Optimizer, maxit: int = None
