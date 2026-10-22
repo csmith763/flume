@@ -47,7 +47,8 @@ class TestUnconstrainedRosenbrock(unittest.TestCase):
             sys_name="rosen_sys",
             top_level_analysis_list=[rosenbrock],
             log_name="flume.log",
-            log_prefix="tests/rosenbrock_unconstrained_paropt" + self.dir_suffix,
+            log_prefix="tests/test_logs/rosenbrock_unconstrained_paropt"
+            + self.dir_suffix,
             parallel_execution=self.parallel_execution,
         )
 
@@ -136,7 +137,8 @@ class TestConstrainedRosenbrock(unittest.TestCase):
             sys_name="rosen_sys_con",
             top_level_analysis_list=[rosenbrock, rosenbrock_con],
             log_name="flume.log",
-            log_prefix="tests/rosenbrock_constrained_paropt" + self.dir_suffix,
+            log_prefix="tests/test_logs/rosenbrock_constrained_paropt"
+            + self.dir_suffix,
             parallel_execution=self.parallel_execution,
         )
 
@@ -222,7 +224,7 @@ class TestThomsonProblem(unittest.TestCase):
             sys_name="thomson_problem",
             top_level_analysis_list=[energy, cons],
             log_name=f"flume_{n_p}.log",
-            log_prefix="tests/thomson_problem_paropt" + self.dir_suffix,
+            log_prefix="tests/test_logs/thomson_problem_paropt" + self.dir_suffix,
             parallel_execution=self.parallel_execution,
         )
 

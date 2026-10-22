@@ -225,6 +225,8 @@ class OpenMDAOGroupAnalysis(Analysis):
         group_output_names: list,
         obj_name: str,
         sub_analyses: list = [],
+        reports: bool | None = None,
+        comm=None,
         **kwargs,
     ):
 
@@ -234,12 +236,19 @@ class OpenMDAOGroupAnalysis(Analysis):
         # Store the OpenMDAO group
         self.om_group = om_group
 
+        # Store the comm type
+        self.comm = comm
+
         # Store the group variables and group outputs
         self.group_var_names = group_variable_names
         self.group_out_names = group_output_names
 
         # Construct an OpenMDAO problem that contains the group in the modle
-        self.prob = om.Problem()
+        self.prob = (
+            om.Problem(comm=comm)
+            if reports is None
+            else om.Problem(reports=reports, comm=comm)
+        )
         self.prob.model.add_subsystem(name=obj_name, subsys=self.om_group)
 
         # Perform the setup for the problem so that the component's inputs and outputs are accessibl

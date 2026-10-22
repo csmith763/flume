@@ -68,7 +68,7 @@ class TestCantileverBeamComplianceMinimization(unittest.TestCase):
             sys_name="BeamThicknessOptimization",
             top_level_analysis_list=[compliance, volume],
             log_name="flume.log",
-            log_prefix="tests/cantilever_beam",
+            log_prefix="tests/test_logs/cantilever_beam",
             parallel_execution=False,
         )
 
@@ -101,7 +101,7 @@ class TestCantileverBeamComplianceMinimization(unittest.TestCase):
             sys_name="BeamThicknessOptimization",
             top_level_analysis_list=[compliance, volume],
             log_name="flume.log",
-            log_prefix="tests/cantilever_beam_parallel",
+            log_prefix="tests/test_logs/cantilever_beam_parallel",
             parallel_execution=True,
         )
 

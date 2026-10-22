@@ -21,6 +21,9 @@ classifiers = [
 Homepage = "https://github.com/smdogroup/flume"
 Documentation = "https://smdogroup.github.io/flume/"
 
+[project.optional-dependencies]
+mpi = ["mpi4py>=3.1"]
+
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements.txt"] }
 
