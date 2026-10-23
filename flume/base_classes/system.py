@@ -1830,6 +1830,19 @@ class System:
 
         return graph
 
+    def _connect_for_graph(self, analysis):
+        """
+        Establish the connections map of a top-level analysis for the graph by analyzing it. With the multi-rank MPI backend this would run a full serial analysis of the whole stack on this rank (setting up and solving every node there), so it is refused: draw the graph after ``execute()`` or the optimization, when the connections already exist.
+        """
+        if self.execution_backend == "mpi" and self._mpi_size > 1:
+            raise RuntimeError(
+                f"graph_network() needs the connections of '{analysis.obj_name}', which "
+                "are established by analyzing it. With the multi-rank MPI backend that "
+                "would run a full serial analysis of the model on this rank; call "
+                "graph_network() after execute() or the optimization instead."
+            )
+        analysis.analyze()
+
     def _static_graph_network(self):
         """
         Private method that is used to greate the graphviz visual in static form, which is ultimately returned by this method.
@@ -1859,7 +1872,7 @@ class System:
             if analysis.connected:
                 pass
             else:
-                analysis.analyze()
+                self._connect_for_graph(analysis)
 
             # Loop through sub analyses in the current stack and add the nodes if they do not already exist
             for i, sub in enumerate(stack):
@@ -2007,7 +2020,7 @@ class System:
             )
 
             if not analysis.connected:
-                analysis.analyze()
+                self._connect_for_graph(analysis)
 
             for i, sub in enumerate(stack):
                 if sub not in self.nodes:

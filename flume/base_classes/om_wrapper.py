@@ -227,8 +227,20 @@ class OpenMDAOGroupAnalysis(Analysis):
         sub_analyses: list = [],
         reports: bool | None = None,
         comm=None,
+        defer_setup: bool = False,
+        post_setup=None,
         **kwargs,
     ):
+        """
+        Wraps an OpenMDAO Group as a Flume Analysis.
+
+        Parameters
+        ----------
+        defer_setup : bool
+            Defaults to False. When True, the OpenMDAO problem is not set up at construction; it is set up on first use (``_analyze`` or an explicit ``setup_problem()`` call). The variables and outputs are then created from ``group_variable_names`` / ``group_output_names`` alone, so each variable must be connected to a sub-analysis output (its placeholder value is never used). Intended for the MPI backend, where every rank constructs every node but only the owner rank analyzes it, so only the owner pays the setup memory.
+        post_setup : callable, optional
+            Function called as ``post_setup(self)`` right after the problem is set up (immediately at construction, or at the deferred setup). Use it for configuration that needs the set-up model, e.g. solver options on subsystems created during setup.
+        """
 
         # Default parameters
         self.default_parameters = {}
@@ -243,6 +255,10 @@ class OpenMDAOGroupAnalysis(Analysis):
         self.group_var_names = group_variable_names
         self.group_out_names = group_output_names
 
+        # Store the post-setup hook and the setup state
+        self._post_setup = post_setup
+        self._problem_is_setup = False
+
         # Construct an OpenMDAO problem that contains the group in the modle
         self.prob = (
             om.Problem(comm=comm)
@@ -251,9 +267,18 @@ class OpenMDAOGroupAnalysis(Analysis):
         )
         self.prob.model.add_subsystem(name=obj_name, subsys=self.om_group)
 
+        if defer_setup:
+            # Perform the base class object initialization
+            super().__init__(obj_name=obj_name, sub_analyses=sub_analyses, **kwargs)
+
+            # Create the variables and output maps from the declared names only
+            self._init_deferred_maps()
+            return
+
         # Perform the setup for the problem so that the component's inputs and outputs are accessibl
         self.prob.setup(force_alloc_complex=True)
         self.prob.final_setup()
+        self._problem_is_setup = True
 
         # Perform the base class object initialization
         super().__init__(obj_name=obj_name, sub_analyses=sub_analyses, **kwargs)
@@ -339,6 +364,94 @@ class OpenMDAOGroupAnalysis(Analysis):
                 # Add the entry to the reverse map (OpenMDAO -> Flume)
                 self._out_rev_map[prom_out_name] = local_name
 
+        # Apply any configuration that needs the set-up model
+        if self._post_setup is not None:
+            self._post_setup(self)
+
+        return
+
+    def _init_deferred_maps(self):
+        """
+        Create the variables and output maps from the declared names, without setting up the OpenMDAO problem (``defer_setup=True``). Shapes and descriptions are filled in by ``setup_problem``.
+        """
+
+        # Variables: placeholder States, replaced by the connected sub-analysis outputs
+        self._var_map = {}
+        self.variables = {}
+        self._var_shape = {}
+        self._om_var_names = []
+        for prom_var_name in self.group_var_names:
+            local_name = prom_var_name.split(".", maxsplit=1)[-1]
+            self._om_var_names.append(prom_var_name)
+            self._var_map[local_name] = prom_var_name
+            self.variables[local_name] = State(
+                value=0.0, desc=f"'{prom_var_name}' (set up on first use)", source=self
+            )
+
+        # Outputs: name maps only; the output States are created by _analyze
+        self._out_map = {}
+        self._out_rev_map = {}
+        self._om_out_names = []
+        for prom_out_name in self.group_out_names:
+            local_name = prom_out_name.split(".", maxsplit=1)[-1]
+            self._om_out_names.append(prom_out_name)
+            self._out_map[local_name] = {"om_name": prom_out_name, "desc": ""}
+            self._out_rev_map[prom_out_name] = local_name
+
+        return
+
+    def setup_problem(self):
+        """
+        Set up the OpenMDAO problem if it has not been set up yet (no-op otherwise). For ``defer_setup=True`` this also records each variable's native shape, fills in the descriptions, and runs the ``post_setup`` hook. Called automatically by ``_analyze``; call it explicitly before accessing ``self.prob`` internals of a deferred node.
+        """
+        if self._problem_is_setup:
+            return
+
+        self.prob.setup(force_alloc_complex=True)
+        self.prob.final_setup()
+        self._problem_is_setup = True
+
+        # Record the native shapes / descriptions of the declared variables and outputs
+        om_inputs = {
+            info["prom_name"]: info
+            for _, info in self.prob.model.list_inputs(
+                out_stream=None, val=True, desc=True
+            )
+        }
+        om_outputs = {
+            info["prom_name"]: info
+            for _, info in self.prob.model.list_outputs(
+                out_stream=None, val=True, desc=True
+            )
+        }
+        missing = [n for n in self.group_var_names if n not in om_inputs] + [
+            n for n in self.group_out_names if n not in om_outputs
+        ]
+        if missing:
+            raise KeyError(
+                f"OpenMDAO model for '{self.obj_name}' has no promoted input/output "
+                f"named: {missing}"
+            )
+
+        for local_name, prom_var_name in self._var_map.items():
+            info = om_inputs[prom_var_name]
+            self._var_shape[local_name] = np.shape(info["val"])
+            # A variable that is not connected to a sub-analysis keeps its own State; give it the model's default value instead of the placeholder
+            state = self.variables[local_name]
+            if state.source is self:
+                value = self._to_native(info["val"])
+                if isinstance(value, np.ndarray):
+                    value = value.reshape(-1)
+                self.variables[local_name] = State(
+                    value=value, desc=info["desc"], source=self
+                )
+        for local_name, out in self._out_map.items():
+            out["desc"] = om_outputs[out["om_name"]]["desc"]
+
+        # Apply any configuration that needs the set-up model
+        if self._post_setup is not None:
+            self._post_setup(self)
+
         return
 
     @staticmethod
@@ -360,6 +473,9 @@ class OpenMDAOGroupAnalysis(Analysis):
         """
         Private analyze method, which calls the run_model method to compute the outputs from the Group using the current input values for the variables. Then, assigns them into the States.
         """
+
+        # Set up the problem on first use (deferred setup)
+        self.setup_problem()
 
         # Loop through the variables and set the values in the State object in the OpenMDAO model
         for var in self.variables:
