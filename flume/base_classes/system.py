@@ -2172,6 +2172,7 @@ class System:
 
             * 'rhs' (float) - specifies the right hand side of the constraint equation. Internally, the optimizer interfaces will use this to convert the constraint to an equivalent form that normalizes it, If the 'rhs' value is 0.0, no scaling is applied
             * 'direction' (str) - string that is either 'geq' (>=), 'leq' (<=), or 'both' (=). Defaults to 'geq' in the event that a direction is not provided.
+            * 'scale' (float, optional) - factor the optimizer *multiplies* the constraint by, which overrides the scaling derived from 'rhs'. Use this to bring a constraint with 'rhs' = 0.0 to O(1). Currently only used by the pyOptSparse interface.
 
         Example
         -------
@@ -2206,6 +2207,10 @@ class System:
             self.con_info[key]["local_name"] = con_local_name
             self.con_info[key]["rhs"] = global_con_name[key]["rhs"]
 
+            # Store the optional user-specified scale for the constraint
+            if "scale" in global_con_name[key].keys():
+                self.con_info[key]["scale"] = global_con_name[key]["scale"]
+
             if "direction" not in global_con_name[key].keys():
                 self.con_info[key]["direction"] = "geq"
             else:
@@ -2225,7 +2230,7 @@ class System:
         Parameters
         ----------
         global_var_name : dict
-            This is a dictionary of dictionaries. Keys for the first dictionary correspond to the global variable names that should be added to the set of design variables, and the values contain information about the variable bounds. If the inner dictionary is empty, then no bounds are provided. Otherwise, the values for the variables lower bound 'lb' and upper bound 'ub' will be added, if included.
+            This is a dictionary of dictionaries. Keys for the first dictionary correspond to the global variable names that should be added to the set of design variables, and the values contain information about the variable bounds. If the inner dictionary is empty, then no bounds are provided. Otherwise, the values for the variables lower bound 'lb' and upper bound 'ub' will be added, if included. An optional 'scale' (float) is the factor the optimizer *multiplies* the variable by (x_opt = x * scale), consistent with the constraint 'scale' and the objective 'obj_scale'. The bounds 'lb' and 'ub' are given in the unscaled variable space. Currently only used by the pyOptSparse interface.
 
         Example
         -------

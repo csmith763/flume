@@ -277,11 +277,11 @@ class FlumePyOptSparseInterface:
             else:
                 ub = 1e30
 
-            # Extract the scale, if it exists
+            # Extract the scale, if it exists (the optimizer sees x_opt = x * scale)
             if "scale" in self.flume_sys.design_vars_info[var]:
-                inv_scale = 1.0 / self.flume_sys.design_vars_info[var]["scale"]
+                scale = self.flume_sys.design_vars_info[var]["scale"]
             else:
-                inv_scale = 1.0
+                scale = 1.0
 
             # Extract the starting value
             x0 = x0dict[var]
@@ -300,7 +300,7 @@ class FlumePyOptSparseInterface:
                 value=x0,
                 lower=np.ones_like(x0) * lb,
                 upper=np.ones_like(x0) * ub,
-                scale=inv_scale,
+                scale=scale,
             )
 
         return
@@ -316,7 +316,7 @@ class FlumePyOptSparseInterface:
 
         Note
         ----
-        If a constraint specified in the Flume System has `rhs != 0.0`, then that value for the right-hand side of the constraint is used as the scale for the pyOptSparse constraint groups. This means the optimizer will see constraints as `con(x) / abs(rhs_val)`.
+        If a constraint specified in the Flume System has `rhs != 0.0`, then that value for the right-hand side of the constraint is used as the scale for the pyOptSparse constraint groups. This means the optimizer will see constraints as `con(x) / abs(rhs_val)`. A 'scale' given when declaring the constraint overrides this, and the optimizer then sees `con(x) * scale`.
         """
 
         # With the multi-rank MPI backend the constraint analyses run on their owner ranks, so a single distributed forward pass provides every constraint value on rank zero (rank zero never analyzes nodes itself)
@@ -349,61 +349,43 @@ class FlumePyOptSparseInterface:
             rhs_val = self.flume_sys.con_info[con]["rhs"]
 
             # Get the values to scale the constraint and the value for the lower bound (note that the optimizer sees constraints as con_opt = con * scale)
+            bound_val = rhs_val
             if rhs_val == 0.0:
-                bound_val = 0.0
                 scale = 1.0
             else:
                 scale = 1 / abs(rhs_val)
-                bound_val = rhs_val
+
+            # A user-specified scale overrides the one derived from the rhs
+            if "scale" in self.flume_sys.con_info[con]:
+                scale = self.flume_sys.con_info[con]["scale"]
 
             # Greater than inequality constraints
             if direction == "geq":
-                # If rhs = 0.0...
-                if rhs_val == 0.0:
-                    optProb.addConGroup(
-                        name=con_name, nCon=con_size, lower=bound_val, upper=None
-                    )
-                # If rhs != 0.0...
-                else:
-                    optProb.addConGroup(
-                        name=con_name,
-                        nCon=con_size,
-                        lower=bound_val,
-                        upper=None,
-                        scale=scale,
-                    )
+                optProb.addConGroup(
+                    name=con_name,
+                    nCon=con_size,
+                    lower=bound_val,
+                    upper=None,
+                    scale=scale,
+                )
             # Less than inequality constraints
             elif direction == "leq":
-                # If rhs = 0.0...
-                if rhs_val == 0.0:
-                    optProb.addConGroup(
-                        name=con_name, nCon=con_size, lower=None, upper=bound_val
-                    )
-                # If rhs != 0.0...
-                else:
-                    optProb.addConGroup(
-                        name=con_name,
-                        nCon=con_size,
-                        lower=None,
-                        upper=bound_val,
-                        scale=scale,
-                    )
+                optProb.addConGroup(
+                    name=con_name,
+                    nCon=con_size,
+                    lower=None,
+                    upper=bound_val,
+                    scale=scale,
+                )
             # Equality constraints
             elif direction == "both":
-                # If rhs = 0.0...
-                if rhs_val == 0.0:
-                    optProb.addConGroup(
-                        name=con_name, nCon=con_size, lower=bound_val, upper=bound_val
-                    )
-                # If rhs != 0.0...
-                else:
-                    optProb.addConGroup(
-                        name=con_name,
-                        nCon=con_size,
-                        lower=bound_val,
-                        upper=bound_val,
-                        scale=scale,
-                    )
+                optProb.addConGroup(
+                    name=con_name,
+                    nCon=con_size,
+                    lower=bound_val,
+                    upper=bound_val,
+                    scale=scale,
+                )
 
             else:
                 raise RuntimeError(
