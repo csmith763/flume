@@ -319,13 +319,21 @@ class FlumePyOptSparseInterface:
         If a constraint specified in the Flume System has `rhs != 0.0`, then that value for the right-hand side of the constraint is used as the scale for the pyOptSparse constraint groups. This means the optimizer will see constraints as `con(x) / abs(rhs_val)`.
         """
 
+        # With the multi-rank MPI backend the constraint analyses run on their owner ranks, so a single distributed forward pass provides every constraint value on rank zero (rank zero never analyzes nodes itself)
+        mpi_multi_rank = (
+            self.flume_sys.execution_backend == "mpi" and self.flume_sys._mpi_size > 1
+        )
+        if mpi_multi_rank and self.flume_sys.con_info:
+            self.flume_sys.execute(debug_print=False)
+
         # Loop through each constraint in the Flume System instance
         for con in self.flume_sys.con_info:
             # Extract the local name of the constraint
             con_name = self.flume_sys.con_info[con]["local_name"]
 
-            # Perform the analysis to get the size for the constraint
-            self.flume_sys.con_info[con]["instance"].analyze(debug_print=False)
+            # Perform the analysis to get the size for the constraint (serial and thread backends; the MPI pass above already populated the outputs)
+            if not mpi_multi_rank:
+                self.flume_sys.con_info[con]["instance"].analyze(debug_print=False)
 
             con_val = self.flume_sys.con_info[con]["instance"].outputs[con_name].value
             if isinstance(con_val, np.ndarray):
