@@ -75,45 +75,65 @@ class FlumeParOptInterface:
         # Initialize the iteration counter
         self.it_counter = 0
 
-        # Set the number of constraints
-        if hasattr(self.flume_sys, "con_info"):
-            # Get the keys for the constraints
-            con_keys = self.flume_sys.con_info.keys()
-
-            ncon = 0
-            for con in con_keys:
-
-                # Get the Analysis object for the current constraint
-                self.flume_sys.con_info[con]["instance"].analyze(debug_print=False)
-
-                # Perform the analysis for the current object and get the size of the constraint
-                con_local_name = self.flume_sys.con_info[con]["local_name"]
-
-                con_val = (
-                    self.flume_sys.con_info[con]["instance"]
-                    .outputs[con_local_name]
-                    .value
-                )
-
-                if isinstance(con_val, np.ndarray):
-                    con_size = con_val.size
-                else:
-                    con_size = 1
-
-                # Store the constraint size
-                self.flume_sys.con_info[con]["size"] = con_size
-
-                if self.flume_sys.con_info[con]["direction"] == "both":
-                    ncon += 2 * con_size
-                else:
-                    ncon += con_size
-
-            self.ncon = ncon
-        else:
-            self.ncon = 0
+        # Set the number of constraints. With the multi-rank MPI backend the constraint analyses can only be distributed once the worker ranks are serving, so the sizing is deferred to optimize_system on rank zero (avoiding a full local analysis on every rank here)
+        self.ncon = None
+        if not self._is_mpi_multi_rank():
+            self._set_constraint_sizes()
 
         # Set the number of design variables and the indices for the ParOpt PVec x
         self._set_ndvs()
+
+        return
+
+    def _is_mpi_multi_rank(self) -> bool:
+        """
+        Returns True when the System uses the MPI backend with more than one rank, in which case only rank zero runs ParOpt and the other ranks serve Flume DAG work.
+        """
+        return (
+            self.flume_sys.execution_backend == "mpi" and self.flume_sys._mpi_size > 1
+        )
+
+    def _set_constraint_sizes(self):
+        """
+        Determines the size of each constraint in the System, storing it in the constraint info dictionary, and sets the total number of ParOpt constraints. For the multi-rank MPI backend this must be called on rank zero while the workers are serving, as it executes the System to obtain the constraint values.
+        """
+
+        if not hasattr(self.flume_sys, "con_info"):
+            self.ncon = 0
+            return
+
+        # With the multi-rank MPI backend, a single distributed forward pass provides every constraint value on rank zero
+        if self._is_mpi_multi_rank():
+            self.flume_sys.execute(debug_print=False)
+
+        ncon = 0
+        for con in self.flume_sys.con_info:
+
+            # Perform the analysis for the current constraint locally (serial and thread backends; the MPI pass above already populated the outputs)
+            if not self._is_mpi_multi_rank():
+                self.flume_sys.con_info[con]["instance"].analyze(debug_print=False)
+
+            # Get the size of the constraint
+            con_local_name = self.flume_sys.con_info[con]["local_name"]
+
+            con_val = (
+                self.flume_sys.con_info[con]["instance"].outputs[con_local_name].value
+            )
+
+            if isinstance(con_val, np.ndarray):
+                con_size = con_val.size
+            else:
+                con_size = 1
+
+            # Store the constraint size
+            self.flume_sys.con_info[con]["size"] = con_size
+
+            if self.flume_sys.con_info[con]["direction"] == "both":
+                ncon += 2 * con_size
+            else:
+                ncon += con_size
+
+        self.ncon = ncon
 
         return
 
@@ -544,7 +564,7 @@ class FlumeParOptInterface:
         check_gradients: bool = False,
     ) -> tuple[np.ndarray, float, list, ParOpt.Optimizer]:
         """
-        Performs optimization on the Flume System using ParOpt. Assumes that the user has set the expected initial values for the Flume Analysis instances prior to calling this method (otherwise the defaults for the Flume Analyses will be used).
+        Performs optimization on the Flume System using ParOpt. Assumes that the user has set the expected initial values for the Flume Analysis instances prior to calling this method (otherwise the defaults for the Flume Analyses will be used). With the MPI backend, call this on every rank: rank zero runs ParOpt (on MPI.COMM_SELF) while the other ranks serve the Flume DAG work it schedules.
 
         Parameters
         ----------
@@ -569,6 +589,8 @@ class FlumeParOptInterface:
             Instance of ParOpt's Optimizer class (in case the user wants to extract any additional information)
 
         If check_gradients is True, nothing is returned
+
+        In MPI mode, non-root ranks serve Flume DAG work and return (None, None, None, None) after rank zero finishes (or nothing if check_gradients is True).
         """
 
         # Check that the algorithm is acceptable
@@ -577,38 +599,57 @@ class FlumeParOptInterface:
                 f"The input for algorithm of '{algorithm} ' is not acceptable. Must be 'tr' or 'mma'."
             )
 
-        # Construct the ParOpt problem
-        paroptprob = self.construct_paropt_problem()
+        # With the MPI backend, ParOpt runs on rank zero only; every other rank serves the DAG work that rank zero schedules until the optimization completes
+        is_mpi_root = self._is_mpi_multi_rank() and (
+            self.flume_sys._mpi_rank == self.flume_sys.mpi_root
+        )
+        if self._is_mpi_multi_rank() and not is_mpi_root:
+            self.flume_sys.serve_mpi_workers()
+            if check_gradients:
+                return
+            return None, None, None, None
 
-        # Get the default options if the user did not provide them
-        if options is None:
-            options = self.get_paropt_default_options(
-                algorithm=algorithm, output_prefix=self.flume_sys.log_prefix
-            )
+        try:
+            # Determine the constraint sizes, if they were deferred at construction (multi-rank MPI backend)
+            if self.ncon is None:
+                self._set_constraint_sizes()
 
-        # Check the gradients for the system, if specified
-        if check_gradients:
-            print("Performing ParOpt Gradient check:")
-            for i in range(3):
-                paroptprob.checkGradients(1e-6)
-            return
+            # Construct the ParOpt problem
+            paroptprob = self.construct_paropt_problem()
 
-        # Perform the optimization
-        opt = ParOpt.Optimizer(paroptprob, options)
+            # Get the default options if the user did not provide them
+            if options is None:
+                options = self.get_paropt_default_options(
+                    algorithm=algorithm, output_prefix=self.flume_sys.log_prefix
+                )
 
-        opt.optimize()
+            # Check the gradients for the system, if specified
+            if check_gradients:
+                print("Performing ParOpt Gradient check:")
+                for i in range(3):
+                    paroptprob.checkGradients(1e-6)
+                return
 
-        # Extract the optimized point
-        x, z, zw, zl, zu = opt.getOptimizedPoint()
+            # Perform the optimization
+            opt = ParOpt.Optimizer(paroptprob, options)
 
-        # Write the optimized point to the json file
-        x_opt = np.array(x)
+            opt.optimize()
 
-        # Get the final value of the objective function and constraints
-        fstar = self.obj_val
-        con_star = self.con_vals
+            # Extract the optimized point
+            x, z, zw, zl, zu = opt.getOptimizedPoint()
 
-        return x_opt, fstar, con_star, opt
+            # Write the optimized point to the json file
+            x_opt = np.array(x)
+
+            # Get the final value of the objective function and constraints
+            fstar = self.obj_val
+            con_star = self.con_vals
+
+            return x_opt, fstar, con_star, opt
+        finally:
+            # Release the MPI workers from their service loop
+            if is_mpi_root:
+                self.flume_sys.shutdown_mpi_workers()
 
     def construct_paropt_problem(self):
         """
@@ -620,7 +661,7 @@ class FlumeParOptInterface:
             Returns an instance of the ParOptProb class
         """
 
-        # Construct the ParOptProblem for the Flume system
+        # Construct the ParOptProblem for the Flume system. ParOpt is kept on MPI.COMM_SELF (rank zero only under the MPI backend) so its communication does not conflict with Flume's DAG-worker protocol on the System communicator
         paroptprob = ParOptProb(MPI.COMM_SELF, prob=self)
 
         return paroptprob
