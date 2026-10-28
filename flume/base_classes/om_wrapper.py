@@ -131,6 +131,14 @@ class OpenMDAOComponentAnalysis(Analysis):
             return arr.item()
         return np.array(arr)
 
+    def _run_model(self):
+        """
+        Solve the OpenMDAO problem at the current variable values. Subclasses can override this to customize the solve, e.g. to retry a failed solve from a different initial state.
+        """
+        self.prob.run_model()
+
+        return
+
     def _analyze(self):
         """
         Private analyze method, which calls run_model method to compute the Component outputs using the variable (input) values, and then assigns them into the States.
@@ -151,7 +159,7 @@ class OpenMDAOComponentAnalysis(Analysis):
             )
 
         # Execute run_model for the problem
-        self.prob.run_model()
+        self._run_model()
 
         # Extract the outputs and assign in the outputs dictionary
         self.outputs = {}
@@ -469,6 +477,14 @@ class OpenMDAOGroupAnalysis(Analysis):
             return arr.item()
         return np.array(arr)
 
+    def _run_model(self):
+        """
+        Solve the OpenMDAO problem at the current variable values. Subclasses can override this to customize the solve, e.g. to retry a failed solve from a different initial state.
+        """
+        self.prob.run_model()
+
+        return
+
     def _analyze(self):
         """
         Private analyze method, which calls the run_model method to compute the outputs from the Group using the current input values for the variables. Then, assigns them into the States.
@@ -492,7 +508,7 @@ class OpenMDAOGroupAnalysis(Analysis):
             )
 
         # Execute run_model for the problem
-        self.prob.run_model()
+        self._run_model()
 
         # Extract the outputs and assign in the outputs dictionary
         self.outputs = {}

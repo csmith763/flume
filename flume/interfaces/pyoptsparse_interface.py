@@ -1,4 +1,5 @@
 import os
+import time
 from flume.base_classes.system import System
 import numpy as np
 from icecream import ic
@@ -23,7 +24,13 @@ except:
 
 class FlumePyOptSparseInterface:
 
-    def __init__(self, flume_sys: System, callback=None, update=None):
+    def __init__(
+        self,
+        flume_sys: System,
+        callback=None,
+        update=None,
+        rejection_log_filename: str = None,
+    ):
         """
         Creates an interface that is used to link an instance of a Flume System to an optimization problem constructed and driven through pyOptSparse. To perform the numeric optimization, the user should call the `optimize_system` method after constructing this object.
 
@@ -35,6 +42,8 @@ class FlumePyOptSparseInterface:
             This is a callable function that gets executed during every iteration of the _objConFun method during optimization. See below for the structure of the function
         update : callable function, default None
             This is a callable function that gets executed at the start of every iteration of the evalObjCon method during optimization. Nominally, this is used to do parameter updates, such as for a continuation strategy
+        rejection_log_filename : str, default None
+            Name of a file that records every rejected trial point (function evaluation number, exception type and message, and the design variables). The full filepath is `os.path.join(self.flume_sys.log_prefix, rejection_log_filename)`. If not provided, rejections are only printed.
 
         Note
         ----
@@ -66,6 +75,16 @@ class FlumePyOptSparseInterface:
 
         # Initialize the iteration counter
         self.it_counter = 0
+
+        # Initialize the counter for all function evaluations, including rejected ones
+        self.eval_counter = 0
+
+        # Store the path of the rejection log, if requested
+        self.rejection_log_path = None
+        if rejection_log_filename is not None:
+            self.rejection_log_path = os.path.join(
+                self.flume_sys.log_prefix, rejection_log_filename
+            )
 
         # Initialize the most recent successful function values, which are returned (with fail=True) when a trial point is rejected; None until the first successful evaluation
         self._last_good_funcs = None
@@ -138,6 +157,9 @@ class FlumePyOptSparseInterface:
                 f"The objective information for the system named '{self.flume_sys.sys_name}' has not yet been declared, so _objconfun can not be executed. Ensure that the function 'declare_objective' has been called."
             )
 
+        # Update the counter for all function evaluations
+        self.eval_counter += 1
+
         # Set the variable values for the various analyses
         self._set_system_variables(xdict)
 
@@ -147,6 +169,7 @@ class FlumePyOptSparseInterface:
         except failures as e:
             print(f"Rejected trial point: {e}")
             ic(xdict)
+            self._log_rejection(xdict, e)
             if self._last_good_funcs is None:
                 raise  # failure at the initial point: no fallback values exist
             return {k: np.copy(v) for k, v in self._last_good_funcs.items()}, True
@@ -181,6 +204,42 @@ class FlumePyOptSparseInterface:
 
         self._last_good_funcs = {k: np.copy(v) for k, v in funcs.items()}
         return funcs, fail
+
+    def _log_rejection(self, xdict: dict, exc: Exception):
+        """
+        Append a rejected trial point to the rejection log (no-op if no log was requested). The entry records the function evaluation number, the exception type and message (which names the failed node under the MPI backend), and the design variables.
+
+        Parameters
+        ----------
+        xdict : dict
+            Dictionary that specifies the rejected design point
+        exc : Exception
+            The exception that caused the rejection
+        """
+        if self.rejection_log_path is None:
+            return
+
+        lines = [
+            f"=== Rejected evaluation {self.eval_counter} "
+            f"(after {self.it_counter} successful) at "
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"{type(exc).__name__}: {exc}",
+            "Design variables:",
+        ]
+        for var, val in xdict.items():
+            val_str = np.array2string(
+                np.atleast_1d(val), precision=6, max_line_width=200
+            )
+            lines.append(f"  {var} = {val_str}")
+
+        # Logging must never mask the rejection itself
+        try:
+            with open(self.rejection_log_path, "a") as f:
+                f.write("\n".join(lines) + "\n\n")
+        except OSError as log_err:
+            print(f"Could not write the rejection log: {log_err}")
+
+        return
 
     def _objconGradFun(self, xdict: dict, funcs: dict):
         """
